@@ -1,0 +1,1 @@
+"""SeCute tracker application package."""

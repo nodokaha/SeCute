@@ -1,0 +1,23 @@
+# Scanner image for the SeCute harness.
+# Contains only scanning tools; targets are mounted read-only at /target.
+FROM debian:bookworm-slim
+
+ARG GITLEAKS_VERSION=8.21.2
+ARG OSV_SCANNER_VERSION=1.9.0
+ARG TRIVY_VERSION=0.58.1
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates git \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+      | tar -xz -C /usr/local/bin gitleaks
+
+RUN curl -sSL -o /usr/local/bin/osv-scanner \
+      "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64" \
+ && chmod +x /usr/local/bin/osv-scanner
+
+RUN curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+      | sh -s -- -b /usr/local/bin "v${TRIVY_VERSION}"
+
+WORKDIR /work

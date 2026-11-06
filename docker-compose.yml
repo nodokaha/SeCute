@@ -1,0 +1,14 @@
+services:
+  tracker:
+    build: ./tracker
+    image: secute-tracker
+    ports:
+      - "8080:8080"
+    environment:
+      SECUTE_DB: /data/secute.db
+    volumes:
+      - secute-data:/data
+    restart: unless-stopped
+
+volumes:
+  secute-data:
