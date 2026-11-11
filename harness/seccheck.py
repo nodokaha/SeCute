@@ -23,6 +23,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 PROFILES = {
     "repo": ["gitleaks", "osv-scanner"],
+    # SBOM-based scan (the approach Coolify uses): Syft builds a software
+    # bill of materials from the target, Grype matches it against its
+    # vulnerability DB. Needs lockfiles / pinned versions / installed
+    # package metadata in the target for packages to be identified.
+    "sbom": ["syft", "grype"],
     # "image": ["trivy"],  # planned: scan a container image reference
     # "web":   ["headers"],  # planned: TLS / header checks for public surface
 }
@@ -82,6 +87,18 @@ def build_scan_script(profile):
             "osv-scanner --format json --output /out/osv.json /target "
             "> /out/osv.log 2>&1; echo $? > /out/osv.exit"
         )
+    if "syft" in PROFILES[profile]:
+        lines.append(
+            "syft dir:/target -o cyclonedx-json=/out/sbom.cdx.json "
+            "> /out/syft.log 2>&1; echo $? > /out/syft.exit"
+        )
+    if "grype" in PROFILES[profile]:
+        # The vulnerability DB is baked into the scanner image and
+        # GRYPE_DB_AUTO_UPDATE=false is set there, so this runs offline.
+        lines.append(
+            "grype sbom:/out/sbom.cdx.json -o json --file /out/grype.json "
+            "> /out/grype.log 2>&1; echo $? > /out/grype.exit"
+        )
     return "; ".join(lines)
 
 
@@ -136,6 +153,48 @@ def normalize(out_dir, target, profile, exit_code, log):
         except json.JSONDecodeError:
             findings = []
         report["tools"]["osv-scanner"] = {"findings": findings}
+        report["summary"]["total_findings"] += len(findings)
+    grype_path = os.path.join(out_dir, "grype.json")
+    if os.path.exists(grype_path):
+        findings = []
+        try:
+            raw = json.load(open(grype_path, encoding="utf-8"))
+            for m in raw.get("matches", []):
+                v = m.get("vulnerability", {})
+                a = m.get("artifact", {})
+                cve = None
+                summary = v.get("description", "")
+                for r in m.get("relatedVulnerabilities", []):
+                    if str(r.get("id", "")).startswith("CVE-"):
+                        cve = r["id"]
+                        if r.get("description"):
+                            summary = r["description"]
+                        break
+                scores = []
+                for c in v.get("cvss", []):
+                    s = c.get("metrics", {}).get("baseScore")
+                    if isinstance(s, (int, float)):
+                        scores.append(s)
+                fix_versions = v.get("fix", {}).get("versions", [])
+                finding = {
+                    "id": cve or v.get("id"),
+                    "summary": summary,
+                    "severity": v.get("severity", ""),
+                    "cvss": max(scores) if scores else None,
+                    "package": a.get("name"),
+                    "version": a.get("version"),
+                    "ecosystem": a.get("type"),
+                    "fix_versions": fix_versions,
+                    # Same idea as Coolify's scan statuses: is there a
+                    # fixed version to move to, or not?
+                    "status": "fix_available" if fix_versions else "no_fix",
+                }
+                if cve and v.get("id") and v.get("id") != cve:
+                    finding["source_id"] = v.get("id")
+                findings.append(finding)
+        except json.JSONDecodeError:
+            findings = []
+        report["tools"]["grype"] = {"findings": findings}
         report["summary"]["total_findings"] += len(findings)
     if log:
         report["log_tail"] = log[-2000:]

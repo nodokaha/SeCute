@@ -15,7 +15,8 @@ python3 seccheck.py run --target /path/to/repo --profile repo --out results/
 Output lands in `results/<YYYYMMDD-HHMMSS>/`:
 
 - `report.json` — normalized result (this is what the tracker ingests)
-- `gitleaks.json` / `osv.json` — raw tool output
+- `gitleaks.json` / `osv.json` / `grype.json` — raw tool output
+- `sbom.cdx.json` — CycloneDX SBOM of the target (sbom profile; kept as evidence)
 - `*.log`, `*.exit` — tool logs and exit codes
 
 ## Profiles
@@ -23,6 +24,7 @@ Output lands in `results/<YYYYMMDD-HHMMSS>/`:
 | profile | tools | notes |
 |---|---|---|
 | `repo` | gitleaks, osv-scanner | secrets (incl. git history) + dependency vulnerabilities |
+| `sbom` | syft, grype | SBOM-based scan (the approach Coolify uses): Syft catalogs the target's packages into an SBOM, Grype matches it against its vulnerability DB. Findings carry `fix_versions` and a `fix_available` / `no_fix` status. The target needs lockfiles, pinned versions or installed package metadata — unpinned declarations (e.g. a bare `fastapi` line in requirements.txt) identify nothing. The Grype DB is baked into the scanner image, so scans run with `--network none`; rebuild the image to refresh the DB |
 | `image` | trivy | planned |
 | `web` | header/TLS checks | planned |
 
