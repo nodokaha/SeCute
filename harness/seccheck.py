@@ -6,10 +6,21 @@ Safety properties:
   - one throwaway container per run, removed afterwards
   - target mounted read-only; host Docker socket is never passed in
   - network is disabled by default (--network bridge only when a check
-    genuinely needs live vulnerability data, and documented as a risk)
+    genuinely needs live vulnerability data, and documented as a risk;
+    bridge is full outbound access, not an allowlist)
   - CPU / memory / pids limits and a hard timeout
+  - all Linux capabilities dropped, no-new-privileges set, the default
+    seccomp profile applied explicitly, read-only root filesystem with
+    a size-capped tmpfs on /tmp
+  - the container process never runs as root: it runs with the host
+    user's uid/gid (the image also defaults to a non-root user)
   - the only writable mount is the results directory
   - secret values from gitleaks are never copied into the report
+
+Result integrity: every check reports its own status (passed /
+findings / error / timeout / invalid) and the report carries an
+overall status (complete / partial / failed), so a scanner that
+failed is never mistaken for a scanner that found nothing.
 """
 import argparse
 import json
@@ -61,17 +72,31 @@ def run_container(target, out_dir, profile, network, timeout):
         "run", "--rm", "--name", name,
         "--network", network,
         "--memory", "2g", "--cpus", "2", "--pids-limit", "256",
-        "--read-only", "--tmpfs", "/tmp",
+        "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=512m",
+        # Isolation hardening: no capabilities at all, no privilege
+        # escalation via setuid binaries, explicit default seccomp.
+        "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges",
+        "--security-opt", "seccomp=default",
+        # Never root inside the container. The host user's uid/gid also
+        # keeps the results directory writable without opening it up.
+        "--user", f"{os.getuid()}:{os.getgid()}",
+        "--env", "HOME=/tmp",
+        # The target is owned by the host user, which git treats as a
+        # different owner than the container uid on some setups.
+        "--env", "GIT_CONFIG_COUNT=1",
+        "--env", "GIT_CONFIG_KEY_0=safe.directory",
+        "--env", "GIT_CONFIG_VALUE_0=/target",
         "-v", f"{target}:/target:ro",
         "-v", f"{out_dir}:/out",
         IMAGE, "bash", "-c", script,
     ]
     try:
         proc = docker(*cmd, timeout=timeout)
-        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or ""), False
     except subprocess.TimeoutExpired:
         docker("rm", "-f", name)
-        return None, "timeout: container removed"
+        return None, "timeout: container removed", True
 
 
 def build_scan_script(profile):
@@ -102,100 +127,195 @@ def build_scan_script(profile):
     return "; ".join(lines)
 
 
-def normalize(out_dir, target, profile, exit_code, log):
+# Per-tool facts needed to judge whether a check actually ran.
+# ok_exits: exit codes that mean the tool finished its scan (some tools
+# use 1 for "found something", which is a successful scan, not a
+# failure). missing_ok_exits: exit codes under which a missing output
+# file still means a clean, successful scan (gitleaks writes no report
+# file when it finds nothing).
+TOOL_SPECS = {
+    "gitleaks": {
+        "output": "gitleaks.json", "exit_file": "gitleaks.exit",
+        "ok_exits": {0, 1}, "missing_ok_exits": {0},
+    },
+    "osv-scanner": {
+        "output": "osv.json", "exit_file": "osv.exit",
+        "ok_exits": {0, 1}, "missing_ok_exits": set(),
+    },
+    "syft": {
+        "output": "sbom.cdx.json", "exit_file": "syft.exit",
+        "ok_exits": {0}, "missing_ok_exits": set(),
+    },
+    "grype": {
+        "output": "grype.json", "exit_file": "grype.exit",
+        "ok_exits": {0}, "missing_ok_exits": set(),
+        "depends_on": "syft",
+    },
+}
+
+OK_STATUSES = ("passed", "findings")
+
+
+def extract_findings(tool, raw):
+    """Normalize one tool's parsed output into report findings."""
+    findings = []
+    if tool == "gitleaks":
+        for f in raw:
+            # Never copy the matched secret itself into the report.
+            findings.append({
+                "rule": f.get("RuleID"),
+                "description": f.get("Description"),
+                "file": f.get("File"),
+                "line": f.get("StartLine"),
+            })
+    elif tool == "osv-scanner":
+        for result in raw.get("results", []):
+            for pkg in result.get("packages", []):
+                p = pkg.get("package", {})
+                for v in pkg.get("vulnerabilities", []):
+                    sev = ""
+                    for s in v.get("severity", []):
+                        if s.get("type") == "CVSS_V3":
+                            sev = s.get("score", "")
+                            break
+                    findings.append({
+                        "id": v.get("id"),
+                        "summary": v.get("summary"),
+                        "severity": sev,
+                        "package": p.get("name"),
+                        "version": p.get("version"),
+                        "ecosystem": p.get("ecosystem"),
+                    })
+    elif tool == "grype":
+        for m in raw.get("matches", []):
+            v = m.get("vulnerability", {})
+            a = m.get("artifact", {})
+            cve = None
+            summary = v.get("description", "")
+            for r in m.get("relatedVulnerabilities", []):
+                if str(r.get("id", "")).startswith("CVE-"):
+                    cve = r["id"]
+                    if r.get("description"):
+                        summary = r["description"]
+                    break
+            scores = []
+            for c in v.get("cvss", []):
+                s = c.get("metrics", {}).get("baseScore")
+                if isinstance(s, (int, float)):
+                    scores.append(s)
+            fix_versions = v.get("fix", {}).get("versions", [])
+            finding = {
+                "id": cve or v.get("id"),
+                "summary": summary,
+                "severity": v.get("severity", ""),
+                "cvss": max(scores) if scores else None,
+                "package": a.get("name"),
+                "version": a.get("version"),
+                "ecosystem": a.get("type"),
+                "fix_versions": fix_versions,
+                # Same idea as Coolify's scan statuses: is there a
+                # fixed version to move to, or not?
+                "status": "fix_available" if fix_versions else "no_fix",
+            }
+            if cve and v.get("id") and v.get("id") != cve:
+                finding["source_id"] = v.get("id")
+            findings.append(finding)
+    # syft produces the SBOM itself; it has no findings of its own.
+    return findings
+
+
+def read_tool_exit(out_dir, spec):
+    path = os.path.join(out_dir, spec["exit_file"])
+    try:
+        with open(path, encoding="utf-8") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def evaluate_tool(tool, out_dir, timed_out):
+    """Decide one check's status from its exit code and output file.
+
+    A check that failed must never look like a check that found
+    nothing, so the status comes from the evidence, in this order:
+    unparseable output is "invalid", a missing output or an unexpected
+    exit code is "error", a check cut off by the container timeout is
+    "timeout", and only a tool that demonstrably finished gets
+    "passed" (no findings) or "findings".
+    """
+    spec = TOOL_SPECS[tool]
+    exit_code = read_tool_exit(out_dir, spec)
+    out_path = os.path.join(out_dir, spec["output"])
+    entry = {"status": None, "exit_code": exit_code, "findings": []}
+    if os.path.exists(out_path):
+        try:
+            with open(out_path, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            entry["status"] = "invalid"
+            entry["detail"] = f"{spec['output']} is not valid JSON"
+            return entry
+        if exit_code is not None and exit_code not in spec["ok_exits"]:
+            entry["status"] = "error"
+            entry["detail"] = f"tool exited with {exit_code}"
+            return entry
+        entry["findings"] = extract_findings(tool, raw)
+        if tool == "syft":
+            entry["artifacts"] = len(raw.get("components", []))
+        entry["status"] = "findings" if entry["findings"] else "passed"
+        return entry
+    # No output file at all.
+    if exit_code in spec["missing_ok_exits"]:
+        entry["status"] = "passed"
+    elif timed_out and exit_code is None:
+        entry["status"] = "timeout"
+        entry["detail"] = "container timed out before this check finished"
+    else:
+        entry["status"] = "error"
+        if exit_code is None:
+            entry["detail"] = "tool did not run to completion (no exit code recorded)"
+        else:
+            entry["detail"] = f"tool exited with {exit_code} and produced no output"
+    return entry
+
+
+def normalize(out_dir, target, profile, exit_code, log, timed_out=False):
+    tools = {}
+    for tool in PROFILES[profile]:
+        tools[tool] = evaluate_tool(tool, out_dir, timed_out)
+    # grype consumes syft's SBOM: if syft did not produce one, a grype
+    # failure is a knock-on effect, so say so instead of blaming grype.
+    for tool, entry in tools.items():
+        depends_on = TOOL_SPECS[tool].get("depends_on")
+        if depends_on and entry["status"] in ("error", "timeout"):
+            dep_status = tools.get(depends_on, {}).get("status")
+            if dep_status not in OK_STATUSES:
+                entry["detail"] = (
+                    f"input from {depends_on} unavailable "
+                    f"({depends_on}: {dep_status}); "
+                    + entry.get("detail", "check did not complete")
+                )
+    ok = sum(1 for e in tools.values() if e["status"] in OK_STATUSES)
+    if tools and ok == len(tools):
+        overall = "complete"
+    elif ok:
+        overall = "partial"
+    else:
+        overall = "failed"
     report = {
         "target": target,
         "profile": profile,
         "finished_at": datetime.now().isoformat(timespec="seconds"),
         "container_exit_code": exit_code,
-        "tools": {},
-        "summary": {"total_findings": 0},
+        "timed_out": timed_out,
+        "status": overall,
+        "tools": tools,
+        "summary": {
+            "total_findings": sum(len(e["findings"]) for e in tools.values()),
+            "tools_ok": ok,
+            "tools_failed": len(tools) - ok,
+        },
     }
-    gitleaks_path = os.path.join(out_dir, "gitleaks.json")
-    if os.path.exists(gitleaks_path):
-        findings = []
-        try:
-            raw = json.load(open(gitleaks_path, encoding="utf-8"))
-            for f in raw:
-                # Never copy the matched secret itself into the report.
-                findings.append({
-                    "rule": f.get("RuleID"),
-                    "description": f.get("Description"),
-                    "file": f.get("File"),
-                    "line": f.get("StartLine"),
-                })
-        except json.JSONDecodeError:
-            findings = []
-        report["tools"]["gitleaks"] = {"findings": findings}
-        report["summary"]["total_findings"] += len(findings)
-    osv_path = os.path.join(out_dir, "osv.json")
-    if os.path.exists(osv_path):
-        findings = []
-        try:
-            raw = json.load(open(osv_path, encoding="utf-8"))
-            for result in raw.get("results", []):
-                for pkg in result.get("packages", []):
-                    p = pkg.get("package", {})
-                    for v in pkg.get("vulnerabilities", []):
-                        sev = ""
-                        for s in v.get("severity", []):
-                            if s.get("type") == "CVSS_V3":
-                                sev = s.get("score", "")
-                                break
-                        findings.append({
-                            "id": v.get("id"),
-                            "summary": v.get("summary"),
-                            "severity": sev,
-                            "package": p.get("name"),
-                            "version": p.get("version"),
-                            "ecosystem": p.get("ecosystem"),
-                        })
-        except json.JSONDecodeError:
-            findings = []
-        report["tools"]["osv-scanner"] = {"findings": findings}
-        report["summary"]["total_findings"] += len(findings)
-    grype_path = os.path.join(out_dir, "grype.json")
-    if os.path.exists(grype_path):
-        findings = []
-        try:
-            raw = json.load(open(grype_path, encoding="utf-8"))
-            for m in raw.get("matches", []):
-                v = m.get("vulnerability", {})
-                a = m.get("artifact", {})
-                cve = None
-                summary = v.get("description", "")
-                for r in m.get("relatedVulnerabilities", []):
-                    if str(r.get("id", "")).startswith("CVE-"):
-                        cve = r["id"]
-                        if r.get("description"):
-                            summary = r["description"]
-                        break
-                scores = []
-                for c in v.get("cvss", []):
-                    s = c.get("metrics", {}).get("baseScore")
-                    if isinstance(s, (int, float)):
-                        scores.append(s)
-                fix_versions = v.get("fix", {}).get("versions", [])
-                finding = {
-                    "id": cve or v.get("id"),
-                    "summary": summary,
-                    "severity": v.get("severity", ""),
-                    "cvss": max(scores) if scores else None,
-                    "package": a.get("name"),
-                    "version": a.get("version"),
-                    "ecosystem": a.get("type"),
-                    "fix_versions": fix_versions,
-                    # Same idea as Coolify's scan statuses: is there a
-                    # fixed version to move to, or not?
-                    "status": "fix_available" if fix_versions else "no_fix",
-                }
-                if cve and v.get("id") and v.get("id") != cve:
-                    finding["source_id"] = v.get("id")
-                findings.append(finding)
-        except json.JSONDecodeError:
-            findings = []
-        report["tools"]["grype"] = {"findings": findings}
-        report["summary"]["total_findings"] += len(findings)
     if log:
         report["log_tail"] = log[-2000:]
     with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
@@ -225,13 +345,18 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     ensure_image()
-    exit_code, log = run_container(target, out_dir, args.profile,
-                                   args.network, args.timeout)
-    report = normalize(out_dir, target, args.profile, exit_code, log)
+    exit_code, log, timed_out = run_container(target, out_dir, args.profile,
+                                              args.network, args.timeout)
+    report = normalize(out_dir, target, args.profile, exit_code, log,
+                       timed_out=timed_out)
     print(f"report: {os.path.join(out_dir, 'report.json')}")
+    print(f"status: {report['status']}")
     print(f"findings: {report['summary']['total_findings']}")
     for tool, data in report["tools"].items():
-        print(f"  {tool}: {len(data['findings'])}")
+        line = f"  {tool}: {data['status']}, {len(data['findings'])} findings"
+        if data.get("detail"):
+            line += f" ({data['detail']})"
+        print(line)
 
 
 if __name__ == "__main__":

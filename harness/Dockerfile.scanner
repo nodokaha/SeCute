@@ -30,7 +30,17 @@ RUN curl -sSL "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSI
 
 # Bake the Grype vulnerability DB into the image so that scans run fully
 # offline (--network none). Refresh the DB by rebuilding the image.
-RUN grype db update
-ENV GRYPE_DB_AUTO_UPDATE=false
+# The DB lives at a fixed path (not in root's home directory) and is
+# world-readable, because the harness runs the container as a non-root
+# user and Grype must still find it.
+RUN mkdir -p /opt/grype/db \
+ && GRYPE_DB_CACHE_DIR=/opt/grype/db grype db update \
+ && chmod -R a+rX /opt/grype
+ENV GRYPE_DB_AUTO_UPDATE=false GRYPE_DB_CACHE_DIR=/opt/grype/db
+
+# Scans run as this non-root user by default. The harness also passes
+# the host user's uid/gid explicitly; either way, never root.
+RUN useradd --create-home --uid 10001 scanner
+USER scanner
 
 WORKDIR /work

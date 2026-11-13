@@ -33,14 +33,41 @@ Output lands in `results/<YYYYMMDD-HHMMSS>/`:
 - One throwaway container per run (`--rm`), target mounted read-only
 - Host Docker socket is never passed into the container
 - Network disabled by default. `--network bridge` exists so osv-scanner
-  can reach OSV.dev; with `--network none` dependency results may be
-  incomplete (offline DB support is a known TODO)
+  can reach OSV.dev; it grants full outbound (and LAN) access, so it is
+  not an allowlist. With `--network none`, a check that needs live data
+  reports `error` rather than silently returning nothing (offline DB
+  support is a known TODO)
 - Limits: 2 GiB memory, 2 CPUs, 256 pids, hard timeout (default 900 s)
+- All Linux capabilities dropped (`--cap-drop ALL`),
+  `--security-opt no-new-privileges`, the default seccomp profile
+  applied explicitly, read-only root filesystem with a 512 MB tmpfs
+  on /tmp
+- The container never runs as root: the harness passes the host user's
+  uid/gid, and the scanner image itself defaults to a non-root user.
+  The Grype DB is baked into a fixed, world-readable path
+  (`/opt/grype/db`) so non-root runs still find it
 - Only the results directory is writable from inside
 - gitleaks matches are reported as rule/file/line only — the secret
   values themselves are never copied into `report.json`
 - No production credentials are ever passed to a check; if a target
   needs a token, use a read-only, short-lived, disposable one
+
+## Check statuses
+
+A check that failed is never reported as a check that found nothing.
+Each tool entry in `report.json` carries a `status`:
+
+| status | meaning |
+|---|---|
+| `passed` | the check ran and found nothing |
+| `findings` | the check ran and found something |
+| `error` | the tool exited abnormally or produced no output |
+| `timeout` | the container timeout cut the check off |
+| `invalid` | the tool's output was not valid JSON |
+
+The report as a whole is `complete` when every check ran, `partial`
+when some did, and `failed` when none did. If Grype cannot run
+because Syft produced no SBOM, its `detail` says so.
 
 ## Feeding results into the tracker
 
