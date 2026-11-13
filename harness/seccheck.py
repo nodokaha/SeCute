@@ -21,16 +21,26 @@ Result integrity: every check reports its own status (passed /
 findings / error / timeout / invalid) and the report carries an
 overall status (complete / partial / failed), so a scanner that
 failed is never mistaken for a scanner that found nothing.
+
+Evidence: the report also carries a provenance section — the tool
+versions the container itself reported, the scanner image id, the
+target's git commit, the run's settings and timestamps, and a
+SHA256 of every raw tool output — so a result can be re-checked
+later against the exact data it was derived from.
 """
 import argparse
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
 
 IMAGE = "secute-scanner"
 HERE = os.path.dirname(os.path.abspath(__file__))
+HARNESS_VERSION = "0.3.0"
+REPORT_SCHEMA_VERSION = 2
 
 PROFILES = {
     "repo": ["gitleaks", "osv-scanner"],
@@ -99,8 +109,30 @@ def run_container(target, out_dir, profile, network, timeout):
         return None, "timeout: container removed", True
 
 
+# How each tool reports its own version. The scan script records
+# these banners before scanning, as report evidence.
+VERSION_COMMANDS = {
+    "gitleaks": "gitleaks version",
+    "osv-scanner": "osv-scanner --version",
+    "syft": "syft version",
+    "grype": "grype version",
+}
+
+
 def build_scan_script(profile):
     lines = ["set -u", "cd /target || exit 1"]
+    for tool in PROFILES[profile]:
+        lines.append(
+            f"{{ echo '== {tool}'; {VERSION_COMMANDS[tool]} 2>&1 || true; }} "
+            ">> /out/versions.txt"
+        )
+    if "grype" in PROFILES[profile]:
+        # Keep the baked-in vulnerability DB's metadata as evidence of
+        # which data Grype matched against.
+        lines.append(
+            "cp /opt/grype/db/*/metadata.json /out/grype-db.json 2>/dev/null "
+            "|| true"
+        )
     if "gitleaks" in PROFILES[profile]:
         lines.append(
             "gitleaks detect --source /target --no-banner "
@@ -279,7 +311,121 @@ def evaluate_tool(tool, out_dir, timed_out):
     return entry
 
 
-def normalize(out_dir, target, profile, exit_code, log, timed_out=False):
+# --- provenance (evidence trail) --------------------------------------
+
+_VERSION_RE = re.compile(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?")
+
+
+def read_tool_versions(out_dir, profile):
+    """Parse the version banners the tools printed about themselves."""
+    try:
+        with open(os.path.join(out_dir, "versions.txt"),
+                  encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return {}
+    raw_by_tool = {}
+    current = None
+    for line in text.splitlines():
+        if line.startswith("== "):
+            current = line[3:].strip()
+            raw_by_tool[current] = []
+        elif current is not None:
+            raw_by_tool[current].append(line)
+    versions = {}
+    for tool in PROFILES[profile]:
+        raw = "\n".join(raw_by_tool.get(tool, [])).strip()
+        if not raw:
+            continue
+        m = _VERSION_RE.search(raw)
+        versions[tool] = {"version": m.group(0) if m else None, "raw": raw}
+    return versions
+
+
+def read_grype_db_info(out_dir):
+    try:
+        with open(os.path.join(out_dir, "grype-db.json"),
+                  encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {
+        "built": data.get("built"),
+        "schema_version": data.get("schemaVersion",
+                                   data.get("schema_version")),
+    }
+
+
+def target_git_info(target):
+    """Best-effort, read-only evidence about the target's git state."""
+    def git(*args):
+        proc = subprocess.run(["git", "-C", target, *args],
+                              capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:
+            raise ValueError("not a git work tree")
+        return proc.stdout.strip()
+    try:
+        return {
+            "commit": git("rev-parse", "HEAD"),
+            "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+            "dirty": bool(git("status", "--porcelain")),
+        }
+    except Exception:
+        return None
+
+
+def scanner_image_info():
+    proc = docker("image", "inspect", IMAGE)
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout)[0]
+    except (json.JSONDecodeError, IndexError, TypeError):
+        return None
+    return {"id": data.get("Id"),
+            "repo_digests": data.get("RepoDigests", [])}
+
+
+def raw_output_hashes(out_dir, profile):
+    """SHA256 and size of each tool's raw output, for later verification."""
+    hashes = {}
+    for tool in PROFILES[profile]:
+        name = TOOL_SPECS[tool]["output"]
+        path = os.path.join(out_dir, name)
+        if not os.path.exists(path):
+            continue
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        hashes[name] = {"sha256": h.hexdigest(),
+                        "bytes": os.path.getsize(path)}
+    return hashes
+
+
+def build_provenance(out_dir, target, profile, network, timeout,
+                     started_at, finished_at):
+    prov = {
+        "harness_version": HARNESS_VERSION,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "settings": {"profile": profile, "network": network,
+                     "timeout": timeout},
+        "scanner_image": scanner_image_info(),
+        "tools": read_tool_versions(out_dir, profile),
+        "target_git": target_git_info(target),
+        "raw_outputs": raw_output_hashes(out_dir, profile),
+    }
+    db_info = read_grype_db_info(out_dir)
+    if db_info:
+        prov["grype_db"] = db_info
+    return prov
+
+
+def normalize(out_dir, target, profile, exit_code, log, timed_out=False,
+              provenance=None):
     tools = {}
     for tool in PROFILES[profile]:
         tools[tool] = evaluate_tool(tool, out_dir, timed_out)
@@ -303,6 +449,7 @@ def normalize(out_dir, target, profile, exit_code, log, timed_out=False):
     else:
         overall = "failed"
     report = {
+        "schema_version": REPORT_SCHEMA_VERSION,
         "target": target,
         "profile": profile,
         "finished_at": datetime.now().isoformat(timespec="seconds"),
@@ -316,6 +463,8 @@ def normalize(out_dir, target, profile, exit_code, log, timed_out=False):
             "tools_failed": len(tools) - ok,
         },
     }
+    if provenance is not None:
+        report["provenance"] = provenance
     if log:
         report["log_tail"] = log[-2000:]
     with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
@@ -345,10 +494,14 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     ensure_image()
+    started_at = datetime.now().isoformat(timespec="seconds")
     exit_code, log, timed_out = run_container(target, out_dir, args.profile,
                                               args.network, args.timeout)
+    provenance = build_provenance(
+        out_dir, target, args.profile, args.network, args.timeout,
+        started_at, datetime.now().isoformat(timespec="seconds"))
     report = normalize(out_dir, target, args.profile, exit_code, log,
-                       timed_out=timed_out)
+                       timed_out=timed_out, provenance=provenance)
     print(f"report: {os.path.join(out_dir, 'report.json')}")
     print(f"status: {report['status']}")
     print(f"findings: {report['summary']['total_findings']}")

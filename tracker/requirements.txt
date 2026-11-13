@@ -1,2 +1,4 @@
-fastapi
-uvicorn[standard]
+# Runtime dependencies, pinned exactly. Bump deliberately and re-test
+# (python -m pytest from the repository root) when updating.
+fastapi==0.162.5
+uvicorn[standard]==0.54.0

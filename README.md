@@ -42,6 +42,16 @@ python3 harness/seccheck.py run --target /path/to/repo --profile repo --out resu
 
 結果は `results/<日時>/report.json`（正規化済み）と各ツールの生出力。詳しくは [harness/README.md](harness/README.md)。
 
+## テスト
+
+```bash
+pip install -r tests/requirements.txt
+python -m pytest            # ユニットテスト（Docker 不要）
+python -m pytest -m docker  # ハーネスの隔離を実コンテナで確認（Docker が必要）
+```
+
+Tracker の DB・取り込み・API と、Harness のチェック別ステータスや検査証跡（ツール版数・対象 commit・生出力のハッシュ）を検証する。Docker 統合テストは Docker のない環境では自動でスキップされる。
+
 ## 構成
 
 | パス | 内容 |
@@ -49,6 +59,7 @@ python3 harness/seccheck.py run --target /path/to/repo --profile repo --out resu
 | `docs/` | 設計書 |
 | `tracker/` | 脆弱性トラッカー（FastAPI + SQLite） |
 | `harness/` | サンドボックス検査ハーネス（Docker + gitleaks / osv-scanner / trivy） |
+| `tests/` | pytest によるテスト一式 |
 | `templates/` | 報告書・記事のテンプレート |
 | `skills/secute/` | 運用手順をまとめたエージェント向け SKILL |
 

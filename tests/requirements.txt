@@ -1,0 +1,6 @@
+# Test-only dependencies, pinned. Install with:
+#   pip install -r tests/requirements.txt
+# then run `python -m pytest` from the repository root.
+pytest==9.2.0
+fastapi==0.162.5
+httpx==0.28.1
