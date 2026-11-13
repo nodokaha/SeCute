@@ -1,21 +1,38 @@
 """SeCute tracker web app (FastAPI).
 
-Personal-use tool: no authentication built in. Run it behind access
-control (reverse proxy / VPN / SSO), never exposed to the public net.
+Personal-use tool. Defense in depth, in the order it is expected to
+be set up:
+
+  1. The compose file binds the port to localhost only. Put a reverse
+     proxy with access control (SSO / VPN / Cloudflare Access) in
+     front before exposing it any wider.
+  2. If SECUTE_API_TOKEN is set, every mutating endpoint (asset
+     registration, ingest, item updates) requires that token in the
+     X-API-Token header. Reads stay open for the dashboard.
+
+Never expose the app to the public net without layer 1.
 """
+import hmac
 import html
 import os
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from . import db, ingest as ingest_mod
 
 DB_PATH = os.environ.get("SECUTE_DB", "/data/secute.db")
+API_TOKEN = os.environ.get("SECUTE_API_TOKEN", "")
 
 app = FastAPI(title="SeCute Tracker")
+
+
+def require_token(x_api_token: str = Header(default="")):
+    """Gate mutating endpoints when SECUTE_API_TOKEN is configured."""
+    if API_TOKEN and not hmac.compare_digest(x_api_token, API_TOKEN):
+        raise HTTPException(401, "missing or invalid X-API-Token")
 
 
 @app.on_event("startup")
@@ -50,7 +67,7 @@ def get_assets():
         conn.close()
 
 
-@app.post("/api/assets")
+@app.post("/api/assets", dependencies=[Depends(require_token)])
 def post_asset(asset: AssetIn):
     conn = _conn()
     try:
@@ -61,7 +78,7 @@ def post_asset(asset: AssetIn):
         conn.close()
 
 
-@app.post("/api/ingest/seed")
+@app.post("/api/ingest/seed", dependencies=[Depends(require_token)])
 def post_seed(entries: list[AssetIn]):
     conn = _conn()
     try:
@@ -72,11 +89,20 @@ def post_seed(entries: list[AssetIn]):
         conn.close()
 
 
-@app.post("/api/ingest")
+@app.post("/api/ingest", dependencies=[Depends(require_token)])
 def post_ingest(source: str = "all"):
     if source not in ("all", "kev", "osv"):
         raise HTTPException(400, "source must be all, kev or osv")
     return ingest_mod.run(DB_PATH, source)
+
+
+@app.get("/api/ingest/runs")
+def get_ingest_runs(limit: int = 20):
+    conn = _conn()
+    try:
+        return db.list_ingest_runs(conn, limit=limit)
+    finally:
+        conn.close()
 
 
 @app.get("/api/items")
@@ -111,13 +137,17 @@ class ItemPatch(BaseModel):
     responded_at: Optional[str] = None
 
 
-@app.patch("/api/items/{item_id}")
+@app.patch("/api/items/{item_id}", dependencies=[Depends(require_token)])
 def patch_item(item_id: int, patch: ItemPatch):
     conn = _conn()
     try:
         if db.get_item(conn, item_id) is None:
             raise HTTPException(404, "item not found")
-        return db.update_item(conn, item_id, patch.model_dump(exclude_none=True))
+        try:
+            return db.update_item(conn, item_id,
+                                  patch.model_dump(exclude_none=True))
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
     finally:
         conn.close()
 

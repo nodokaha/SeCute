@@ -1,10 +1,18 @@
 """SQLite storage for the SeCute tracker.
 
 Tables:
-  assets - inventory of products in scope (name + version + match keywords)
-  vulns  - vulnerability records fetched from external sources
-  items  - one tracked entry per (vuln, asset) pair; carries the fields the
-           reports are generated from: overview / scope / response / status
+  assets       - inventory of products in scope (name + version + keywords)
+  vulns        - merged vulnerability view shown by the API/dashboard
+  vuln_sources - one record per (vuln, source): what each source actually
+                 said, kept separately so re-ingesting one source never
+                 overwrites another source's data; `vulns` is rebuilt
+                 from these rows
+  items        - one tracked entry per (vuln, asset) pair; carries the
+                 fields the reports are generated from (overview / scope
+                 / response / status) plus how the match was decided
+                 (match_method / match_reason)
+  ingest_runs  - one row per source per ingest run, so a failed source
+                 is visible instead of silently missing
 """
 import sqlite3
 
@@ -30,6 +38,18 @@ CREATE TABLE IF NOT EXISTS vulns (
   fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
   raw TEXT NOT NULL DEFAULT '{}'
 );
+CREATE TABLE IF NOT EXISTS vuln_sources (
+  cve_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
+  severity TEXT NOT NULL DEFAULT '',
+  published_at TEXT,
+  url TEXT NOT NULL DEFAULT '',
+  raw TEXT NOT NULL DEFAULT '{}',
+  fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (cve_id, source)
+);
 CREATE TABLE IF NOT EXISTS items (
   id INTEGER PRIMARY KEY,
   cve_id TEXT REFERENCES vulns(cve_id),
@@ -40,21 +60,44 @@ CREATE TABLE IF NOT EXISTS items (
   response TEXT NOT NULL DEFAULT '',
   triage TEXT NOT NULL DEFAULT 'watch',
   status TEXT NOT NULL DEFAULT 'unconfirmed',
+  match_method TEXT NOT NULL DEFAULT '',
+  match_reason TEXT NOT NULL DEFAULT '',
   due_date TEXT,
   responded_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(cve_id, asset_id)
 );
+CREATE TABLE IF NOT EXISTS ingest_runs (
+  id INTEGER PRIMARY KEY,
+  source TEXT NOT NULL,
+  status TEXT NOT NULL,
+  imported INTEGER NOT NULL DEFAULT 0,
+  error TEXT NOT NULL DEFAULT '',
+  started_at TEXT NOT NULL DEFAULT (datetime('now')),
+  finished_at TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_items_status ON items(status);
 """
 
-# triage: action_needed / watch / not_affected
-# status: unconfirmed / in_progress / patched / mitigated / not_affected
+# Columns added after the first release; init_db applies them to
+# existing databases so upgrades need no manual migration.
+ITEM_ADDED_COLUMNS = {
+    "match_method": "TEXT NOT NULL DEFAULT ''",
+    "match_reason": "TEXT NOT NULL DEFAULT ''",
+}
+
+TRIAGE_VALUES = {"action_needed", "watch", "not_affected"}
+STATUS_VALUES = {"unconfirmed", "in_progress", "patched", "mitigated",
+                 "not_affected"}
 ITEM_MUTABLE_FIELDS = {
     "title", "overview", "scope", "response",
     "triage", "status", "due_date", "responded_at",
 }
+
+# When several sources describe the same vulnerability, earlier sources
+# in this list win for display fields in the merged view.
+SOURCE_PRIORITY = ["kev", "osv"]
 
 
 def connect(db_path):
@@ -68,26 +111,107 @@ def init_db(db_path):
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        existing = {r[1] for r in conn.execute("PRAGMA table_info(items)")}
+        for column, ddl in ITEM_ADDED_COLUMNS.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE items ADD COLUMN {column} {ddl}")
         conn.commit()
     finally:
         conn.close()
 
 
+def _merge_source_rows(rows):
+    """Merge per-source records of one vulnerability into one view row.
+
+    Display fields come from the highest-priority source that has a
+    non-empty value, except severity: a "known-exploited" flag from any
+    source always wins, because it changes the urgency.
+    """
+    def by_priority(field):
+        for row in rows:
+            if row[field]:
+                return row[field]
+        return rows[0][field] if rows else ""
+
+    severity = ""
+    if any(r["severity"] == "known-exploited" for r in rows):
+        severity = "known-exploited"
+    else:
+        severity = by_priority("severity")
+    published = [r["published_at"] for r in rows if r["published_at"]]
+    return {
+        "source": ",".join(r["source"] for r in rows),
+        "title": by_priority("title"),
+        "summary": by_priority("summary"),
+        "severity": severity,
+        "published_at": min(published) if published else None,
+        "url": by_priority("url"),
+        "raw": by_priority("raw"),
+    }
+
+
 def upsert_vuln(conn, cve_id, source, title="", summary="", severity="",
                 published_at=None, url="", raw="{}"):
+    """Store one source's record, then rebuild the merged view.
+
+    The per-source record is the unit of storage: another source's
+    record for the same vulnerability is left untouched.
+    """
+    conn.execute(
+        """
+        INSERT INTO vuln_sources (cve_id, source, title, summary, severity,
+                                  published_at, url, raw, fetched_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(cve_id, source) DO UPDATE SET
+          title=excluded.title, summary=excluded.summary,
+          severity=excluded.severity, published_at=excluded.published_at,
+          url=excluded.url, raw=excluded.raw, fetched_at=datetime('now')
+        """,
+        (cve_id, source, title, summary, severity, published_at, url, raw),
+    )
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM vuln_sources WHERE cve_id = ?", (cve_id,))]
+    rows.sort(key=lambda r: (SOURCE_PRIORITY.index(r["source"])
+                             if r["source"] in SOURCE_PRIORITY else 99,
+                             r["source"]))
+    merged = _merge_source_rows(rows)
     conn.execute(
         """
         INSERT INTO vulns (cve_id, source, title, summary, severity,
-                           published_at, url, raw, fetched_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                           published_at, url, fetched_at, raw)
+        VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
         ON CONFLICT(cve_id) DO UPDATE SET
           source=excluded.source, title=excluded.title,
           summary=excluded.summary, severity=excluded.severity,
           published_at=excluded.published_at, url=excluded.url,
           raw=excluded.raw, fetched_at=datetime('now')
         """,
-        (cve_id, source, title, summary, severity, published_at, url, raw),
+        (cve_id, merged["source"], merged["title"], merged["summary"],
+         merged["severity"], merged["published_at"], merged["url"],
+         merged["raw"]),
     )
+
+
+def list_vuln_sources(conn, cve_id):
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM vuln_sources WHERE cve_id = ? ORDER BY source",
+        (cve_id,))]
+
+
+def record_ingest_run(conn, source, status, imported=0, error=""):
+    conn.execute(
+        """
+        INSERT INTO ingest_runs (source, status, imported, error, finished_at)
+        VALUES (?, ?, ?, ?, datetime('now'))
+        """,
+        (source, status, imported, error),
+    )
+    conn.commit()
+
+
+def list_ingest_runs(conn, limit=20):
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM ingest_runs ORDER BY id DESC LIMIT ?", (limit,))]
 
 
 def add_asset(conn, name, version="", ecosystem="", package_name="",
@@ -106,14 +230,16 @@ def list_assets(conn):
     return [dict(r) for r in conn.execute("SELECT * FROM assets ORDER BY name")]
 
 
-def find_or_create_item(conn, cve_id, asset_id, title="", triage="watch"):
+def find_or_create_item(conn, cve_id, asset_id, title="", triage="watch",
+                        match_method="", match_reason=""):
     conn.execute(
         """
-        INSERT INTO items (cve_id, asset_id, title, triage)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO items (cve_id, asset_id, title, triage,
+                           match_method, match_reason)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(cve_id, asset_id) DO NOTHING
         """,
-        (cve_id, asset_id, title, triage),
+        (cve_id, asset_id, title, triage, match_method, match_reason),
     )
     row = conn.execute(
         "SELECT * FROM items WHERE cve_id IS ? AND asset_id IS ?",
@@ -164,6 +290,14 @@ def get_item(conn, item_id):
 def update_item(conn, item_id, fields):
     fields = {k: v for k, v in fields.items()
               if k in ITEM_MUTABLE_FIELDS and v is not None}
+    if "triage" in fields and fields["triage"] not in TRIAGE_VALUES:
+        raise ValueError(
+            f"invalid triage: {fields['triage']!r} "
+            f"(allowed: {', '.join(sorted(TRIAGE_VALUES))})")
+    if "status" in fields and fields["status"] not in STATUS_VALUES:
+        raise ValueError(
+            f"invalid status: {fields['status']!r} "
+            f"(allowed: {', '.join(sorted(STATUS_VALUES))})")
     if not fields:
         return get_item(conn, item_id)
     assignments = ", ".join(f"{k} = ?" for k in fields)
