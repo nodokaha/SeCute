@@ -29,6 +29,72 @@ Output lands in `results/<YYYYMMDD-HHMMSS>/`:
 | `image` | trivy | planned |
 | `web` | header/TLS checks | planned |
 
+## Traffic audit (`traffic_audit.py`)
+
+An original egress-audit tool — no third-party proxy package. It is a
+small forward proxy written against the Python standard library (the
+`openssl` CLI is used only to mint a throwaway local CA), built to
+answer a different question from the scanners above: not "what is in
+the code" but "what does the running app actually send, and where".
+
+```bash
+# built-in self-check: a fake app talks to an allowed API and to an
+# unlisted tracker; only the tracker traffic is flagged
+python3 traffic_audit.py demo --out results/
+
+# audit a real command (canaries arrive via SECUTE_CANARY_* env vars;
+# plant them in the app's test data / fixtures)
+python3 traffic_audit.py run --out results/ \
+    --allow api.example.com --source /path/to/repo \
+    -- python3 your_app.py
+```
+
+How it works:
+
+- Each run generates synthetic canary values (email, phone, device
+  id, display name, chat message, access token) and exports them to
+  the target as `SECUTE_CANARY_*`. If a canary shows up in traffic to
+  a destination that is not allowlisted, that is a deterministic
+  `canary_egress` finding — no inference involved.
+- The target's `http_proxy` / `https_proxy` point at the audit proxy.
+  HTTPS is decrypted locally with a per-run CA (handed to the target
+  via `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `NODE_EXTRA_CA_CERTS` /
+  `CURL_CA_BUNDLE`). CONNECT tunnels that cannot be decrypted are
+  relayed blind and recorded as uninspected — the report status drops
+  to `partial` instead of pretending they were clean.
+- Further deterministic checks: sensitive field names or
+  `Authorization` / `Cookie` headers sent to non-allowlisted hosts,
+  unknown destinations, and sensitive data over plain HTTP.
+- With `--source`, findings are mapped back to candidate code
+  locations by searching the source tree for the destination host,
+  the request path and the field names (file + line, like gitleaks).
+- `--map-host host=ip:port` redirects a destination's TCP target, so
+  local stand-ins can replace external services during an audit.
+
+Output lands in `results/<YYYYMMDD-HHMMSS>/` as a schema_version 2
+`report.json` (tool name `egress-proxy`) plus:
+
+- `capture.json` — redacted request log: field names, body SHA256 and
+  sizes, headers with secrets replaced. Bodies and canary values are
+  never written here or into `report.json` (hashes only).
+- `canaries.json` — the planted values (mode 0600). This one file
+  *does* contain the canary values; treat it as a secret and delete
+  it with the results.
+- `ca/` — the throwaway CA and per-host certificates. The CA is only
+  trusted by the audited process, via environment variables, for the
+  duration of the run. Never install it system-wide; delete it with
+  the results.
+- `target.log` — the target command's stdout/stderr.
+
+Limits, honestly: this is a standalone runner, not yet a seccheck
+profile, because it *executes* the target instead of scanning a
+read-only mount — containerising it needs the stronger isolation
+treatment first. Certificate pinning, QUIC, DNS-over-HTTPS and code
+that ignores proxy environment variables can bypass the proxy; see
+"coverage honesty" above. Apps that do not take their data from the
+environment need the canaries planted by hand (fixture data, a test
+account, a seed file) — the values are in `canaries.json`.
+
 ## Safety properties
 
 - One throwaway container per run (`--rm`), target mounted read-only
