@@ -24,7 +24,7 @@ curl -X POST localhost:8080/api/ingest
 open http://localhost:8080/
 ```
 
-Tracker は個人用の前提。compose はポートを localhost にだけ bind する。公開ネットワークには出さず、リバースプロキシやアクセス制御の内側で使うこと。`SECUTE_API_TOKEN` を設定すると、書き込み系 API（資産登録・取り込み・項目更新）に `X-API-Token` ヘッダーが必須になる。
+Tracker は個人用の前提。compose はポートを localhost にだけ bind する。公開ネットワークには出さず、リバースプロキシやアクセス制御の内側で使うこと。`SECUTE_API_TOKEN` は必須で、書き込み系 API（資産登録・取り込み・項目更新）に `X-API-Token` ヘッダーが必須になる。
 
 取り込みまわりの性質：
 
