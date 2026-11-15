@@ -843,12 +843,6 @@ def run_target(command, out_dir, allowlist=None, source_dir=None,
     # Do not inherit arbitrary host environment variables (tokens, cloud
     # credentials, CI secrets, etc.) into the target process.
     env = build_target_env(out_dir, proxy_url, ca, canaries)
-    if ca is not None:
-        for var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE",
-                    "NODE_EXTRA_CA_CERTS", "CURL_CA_BUNDLE"):
-            env[var] = ca.ca_crt
-    for c in canaries:
-        env[c["env"]] = c["value"]
 
     timed_out = False
     child_exit = None
