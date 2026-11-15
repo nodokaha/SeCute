@@ -30,13 +30,17 @@ app = FastAPI(title="SeCute Tracker")
 
 
 def require_token(x_api_token: str = Header(default="")):
-    """Gate mutating endpoints when SECUTE_API_TOKEN is configured."""
-    if API_TOKEN and not hmac.compare_digest(x_api_token, API_TOKEN):
+    """Fail closed when the write API token is missing or does not match."""
+    if not API_TOKEN:
+        raise HTTPException(503, "SECUTE_API_TOKEN is not configured")
+    if not hmac.compare_digest(x_api_token, API_TOKEN):
         raise HTTPException(401, "missing or invalid X-API-Token")
 
 
 @app.on_event("startup")
 def _startup():
+    if not API_TOKEN:
+        raise RuntimeError("SECUTE_API_TOKEN must be configured before startup")
     db.init_db(DB_PATH)
 
 

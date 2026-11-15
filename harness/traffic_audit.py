@@ -784,6 +784,41 @@ def parse_host_map(items):
     return host_map
 
 
+def build_target_env(out_dir, proxy_url, ca, canaries):
+    """Build a minimal child environment without inheriting host secrets."""
+    home = os.path.join(out_dir, "target-home")
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": home,
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "http_proxy": proxy_url, "https_proxy": proxy_url,
+        "HTTP_PROXY": proxy_url, "HTTPS_PROXY": proxy_url,
+        "no_proxy": "", "NO_PROXY": "",
+        "SECUTE_AUDIT": "traffic",
+    }
+    if ca is not None:
+        for var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE",
+                    "NODE_EXTRA_CA_CERTS", "CURL_CA_BUNDLE"):
+            env[var] = ca.ca_crt
+    for c in canaries:
+        env[c["env"]] = c["value"]
+    return env
+
+
+def redact_target_log(output, canaries):
+    """Redact planted canaries and common credential patterns in target logs."""
+    output = redact_text(output, canaries)
+    output = re.sub(
+        r"(?i)(authorization\s*[:=]\s*(?:bearer|basic)\s+)[^\s,;]+",
+        r"\1<redacted>", output)
+    output = re.sub(
+        r"(?i)((?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*)"
+        r"([^\s,;]+)",
+        r"\1<redacted>", output)
+    return output
+
+
 def run_target(command, out_dir, allowlist=None, source_dir=None,
                mitm=True, host_map=None, timeout=300, port=0):
     """Run `command` with its traffic routed through the audit proxy."""
@@ -805,13 +840,9 @@ def run_target(command, out_dir, allowlist=None, source_dir=None,
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
-    env = dict(os.environ)
-    env.update({
-        "http_proxy": proxy_url, "https_proxy": proxy_url,
-        "HTTP_PROXY": proxy_url, "HTTPS_PROXY": proxy_url,
-        "no_proxy": "", "NO_PROXY": "",
-        "SECUTE_AUDIT": "traffic",
-    })
+    # Do not inherit arbitrary host environment variables (tokens, cloud
+    # credentials, CI secrets, etc.) into the target process.
+    env = build_target_env(out_dir, proxy_url, ca, canaries)
     if ca is not None:
         for var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE",
                     "NODE_EXTRA_CA_CERTS", "CURL_CA_BUNDLE"):
@@ -827,8 +858,8 @@ def run_target(command, out_dir, allowlist=None, source_dir=None,
         child_exit = proc.returncode
         with open(os.path.join(out_dir, "target.log"), "w",
                   encoding="utf-8") as fh:
-            fh.write(proc.stdout or "")
-            fh.write(proc.stderr or "")
+            fh.write(redact_target_log(
+                (proc.stdout or "") + (proc.stderr or ""), canaries))
     except subprocess.TimeoutExpired:
         timed_out = True
     finally:
@@ -954,6 +985,9 @@ def main():
                        help="host=ip:port redirect for the TCP target "
                             "(local stand-ins for external services)")
     run_p.add_argument("--timeout", type=int, default=300)
+    run_p.add_argument(
+        "--unsafe-host-execution", action="store_true",
+        help="acknowledge that the target command runs directly on the host")
     run_p.add_argument("target_cmd", nargs=argparse.REMAINDER,
                        help="target command, after --")
 
@@ -967,6 +1001,11 @@ def main():
         out_dir = os.path.abspath(os.path.join(args.out, stamp))
         report = run_demo(out_dir)
     else:
+        if not args.unsafe_host_execution:
+            raise SystemExit(
+                "refusing to execute an untrusted target on the host; "
+                "use --unsafe-host-execution only for trusted disposable "
+                "targets until the container-isolated runner is available")
         command = list(args.target_cmd)
         if command and command[0] == "--":
             command = command[1:]

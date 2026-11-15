@@ -9,9 +9,8 @@ services:
       - "127.0.0.1:8080:8080"
     environment:
       SECUTE_DB: /data/secute.db
-      # Optional second layer: when set, mutating API endpoints
-      # require this value in the X-API-Token header.
-      # SECUTE_API_TOKEN: change-me
+      # Required: mutating API endpoints always require this token.
+      SECUTE_API_TOKEN: ${SECUTE_API_TOKEN:?Set SECUTE_API_TOKEN in .env}
     volumes:
       - secute-data:/data
     restart: unless-stopped

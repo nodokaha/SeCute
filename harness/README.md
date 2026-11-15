@@ -44,7 +44,7 @@ python3 traffic_audit.py demo --out results/
 
 # audit a real command (canaries arrive via SECUTE_CANARY_* env vars;
 # plant them in the app's test data / fixtures)
-python3 traffic_audit.py run --out results/ \
+python3 traffic_audit.py run --unsafe-host-execution --out results/ \
     --allow api.example.com --source /path/to/repo \
     -- python3 your_app.py
 ```
@@ -84,12 +84,18 @@ Output lands in `results/<YYYYMMDD-HHMMSS>/` as a schema_version 2
   trusted by the audited process, via environment variables, for the
   duration of the run. Never install it system-wide; delete it with
   the results.
-- `target.log` — the target command's stdout/stderr.
+- `target.log` — stdout/stderr with canary values and common credential
+  patterns redacted. Treat logs as sensitive; arbitrary application
+  secrets cannot be reliably detected.
 
 Limits, honestly: this is a standalone runner, not yet a seccheck
-profile, because it *executes* the target instead of scanning a
-read-only mount — containerising it needs the stronger isolation
-treatment first. Certificate pinning, QUIC, DNS-over-HTTPS and code
+profile. The current runner still executes the target on the host and
+is therefore blocked by default in the CLI. The explicit
+\`--unsafe-host-execution\` flag is only for trusted, disposable test
+commands; it is not a sandbox and must not be used for untrusted
+repositories. Host environment variables are not inherited by the
+child process. A container-isolated runner remains required before
+this feature can safely execute third-party targets. Certificate pinning, QUIC, DNS-over-HTTPS and code
 that ignores proxy environment variables can bypass the proxy; see
 "coverage honesty" above. Apps that do not take their data from the
 environment need the canaries planted by hand (fixture data, a test
