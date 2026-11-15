@@ -15,7 +15,7 @@
 printf 'SECUTE_API_TOKEN=%s\n' "$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')" > .env
 docker compose up -d --build
 # 資産の初期登録（例）
-curl -X POST localhost:8080/api/ingest/seed \
+curl -X POST localhost:8080/api/ingest -H "X-API-Token: $(grep '^SECUTE_API_TOKEN=' .env | cut -d= -f2-)"/seed \
   -H "X-API-Token: $(grep '^SECUTE_API_TOKEN=' .env | cut -d= -f2-)" \
   -H 'Content-Type: application/json' -d @tracker/config/assets.example.json
 # 脆弱性情報の取り込み

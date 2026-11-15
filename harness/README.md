@@ -91,7 +91,7 @@ Output lands in `results/<YYYYMMDD-HHMMSS>/` as a schema_version 2
 Limits, honestly: this is a standalone runner, not yet a seccheck
 profile. The current runner still executes the target on the host and
 is therefore blocked by default in the CLI. The explicit
-\`--unsafe-host-execution\` flag is only for trusted, disposable test
+--unsafe-host-execution flag is only for trusted, disposable test
 commands; it is not a sandbox and must not be used for untrusted
 repositories. Host environment variables are not inherited by the
 child process. A container-isolated runner remains required before
