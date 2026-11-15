@@ -3,6 +3,8 @@
 Sources:
   - CISA KEV (known exploited vulnerabilities catalog, JSON feed)
   - OSV.dev API (per-asset query by package + version)
+  - Coolify API (image scan findings per application / service /
+    database; configured with COOLIFY_BASE_URL / COOLIFY_API_TOKEN)
 
 JPCERT/CC alerts have no stable machine-readable feed used here yet;
 add a fetcher alongside these when wiring them up.
@@ -32,19 +34,24 @@ OSV_API = "https://api.osv.dev/v1/query"
 USER_AGENT = "SeCute-Tracker/0.2"
 
 
-def fetch_json(url, payload=None):
+def fetch_json(url, payload=None, headers=None):
     data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"User-Agent": USER_AGENT, "Content-Type": "application/json"},
-    )
+    merged = {"User-Agent": USER_AGENT, "Content-Type": "application/json"}
+    if headers:
+        merged.update(headers)
+    req = urllib.request.Request(url, data=data, headers=merged)
     with urllib.request.urlopen(req, timeout=60) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
+class ConfigError(Exception):
+    """A source is missing required configuration (environment)."""
+
+
 def classify_error(exc):
     """Bucket a fetch/parse failure so runs can be told apart."""
+    if isinstance(exc, ConfigError):
+        return f"config: {exc}"
     if isinstance(exc, urllib.error.HTTPError):
         return f"http {exc.code}"
     if isinstance(exc, (TimeoutError, socket.timeout)):
@@ -278,6 +285,148 @@ def ingest_osv(conn):
     return result
 
 
+# --- Coolify ----------------------------------------------------------
+
+COOLIFY_LIST_PATH = "/api/v1/vulnerabilities"
+# Findings for one resource live under its pluralized type:
+# /api/v1/{applications|databases|services}/{uuid}/vulnerabilities
+COOLIFY_RESOURCE_PATH = "/api/v1/{segment}/{uuid}/vulnerabilities"
+COOLIFY_RESOURCE_SEGMENTS = {
+    "application": "applications",
+    "database": "databases",
+    "service": "services",
+}
+COOLIFY_PER_PAGE = 100
+
+
+def _coolify_config():
+    """Read the Coolify connection settings from the environment.
+
+    Nothing is hardcoded: without both variables the source cannot
+    run, and the caller records that as a config failure.
+    """
+    base = os.environ.get("COOLIFY_BASE_URL", "").rstrip("/")
+    token = os.environ.get("COOLIFY_API_TOKEN", "")
+    if not base:
+        raise ConfigError("COOLIFY_BASE_URL is not set")
+    if not token:
+        raise ConfigError("COOLIFY_API_TOKEN is not set")
+    return base, {"Authorization": f"Bearer {token}"}
+
+
+def _coolify_findings(base, headers, resource):
+    """Fetch all findings for one resource, following pagination."""
+    rtype = resource.get("type", "")
+    segment = COOLIFY_RESOURCE_SEGMENTS.get(rtype, f"{rtype}s")
+    url = base + COOLIFY_RESOURCE_PATH.format(
+        segment=segment, uuid=resource["uuid"])
+    findings = []
+    page = 1
+    while True:
+        payload = fetch_json(
+            f"{url}?page={page}&per_page={COOLIFY_PER_PAGE}",
+            headers=headers)
+        batch = payload.get("findings", [])
+        findings.extend(batch)
+        total = (payload.get("pagination") or {}).get("total")
+        if not batch or total is None or len(findings) >= total:
+            return findings
+        page += 1
+
+
+def _coolify_occurrence_text(resource, finding):
+    """One human-readable line describing where a finding was seen."""
+    parts = []
+    if finding.get("package"):
+        text = finding["package"]
+        if finding.get("version"):
+            text += f" {finding['version']}"
+        if finding.get("package_type"):
+            text += f" ({finding['package_type']})"
+        parts.append(text)
+    if finding.get("image_ref"):
+        parts.append(f"image {finding['image_ref']}")
+    label = resource.get("name") or resource.get("uuid", "")
+    if label:
+        parts.append(f"resource {label} ({resource.get('type', '')})")
+    if finding.get("fixed_in"):
+        parts.append(f"fixed in {finding['fixed_in']}")
+    if finding.get("cvss_score"):
+        parts.append(f"CVSS {finding['cvss_score']}")
+    if finding.get("epss"):
+        parts.append(f"EPSS {finding['epss']}")
+    if finding.get("state"):
+        parts.append(f"state {finding['state']}")
+    return "; ".join(parts)
+
+
+def ingest_coolify(conn):
+    """Import image scan findings from a Coolify instance.
+
+    The list endpoint returns every application / service / database
+    of the team with its stored scan status; findings are then
+    fetched per resource. The same vulnerability can appear in
+    several resources and images, so occurrences are grouped by
+    vulnerability id and stored as one per-source record whose
+    summary and raw payload keep every occurrence's resource and
+    image context. Findings are not matched against tracker assets:
+    only vulnerability records are stored.
+    """
+    base, headers = _coolify_config()
+    payload = fetch_json(base + COOLIFY_LIST_PATH, headers=headers)
+    resources = payload.get("resources", [])
+    grouped = {}
+    order = []
+    finding_count = 0
+    for resource in resources:
+        for finding in _coolify_findings(base, headers, resource):
+            finding_count += 1
+            vuln_id = finding.get("display_id") or finding.get("id")
+            if not vuln_id:
+                continue
+            if vuln_id not in grouped:
+                grouped[vuln_id] = []
+                order.append(vuln_id)
+            grouped[vuln_id].append((resource, finding))
+    for vuln_id in order:
+        occurrences = grouped[vuln_id]
+
+        def first(field):
+            return next((f.get(field, "") for _, f in occurrences
+                         if f.get(field)), "")
+
+        if any(f.get("kev") for _, f in occurrences):
+            severity = "known-exploited"
+        else:
+            severity = first("severity")
+        summary = "; ".join(
+            _coolify_occurrence_text(r, f)
+            for r, f in occurrences)[:2000]
+        raw = json.dumps({
+            "occurrences": [{
+                "resource_uuid": r.get("uuid", ""),
+                "resource_name": r.get("name", ""),
+                "resource_type": r.get("type", ""),
+                "checked_at": (r.get("security") or {}).get("checked_at"),
+                "finding": f,
+            } for r, f in occurrences],
+        }, ensure_ascii=False)
+        db.upsert_vuln(
+            conn,
+            cve_id=vuln_id,
+            source="coolify",
+            title=first("title"),
+            summary=summary,
+            severity=severity,
+            published_at=None,
+            url=first("advisory_url"),
+            raw=raw,
+        )
+    conn.commit()
+    return {"source": "coolify", "status": "ok", "imported": len(order),
+            "resources": len(resources), "findings": finding_count}
+
+
 def seed_assets(conn, path):
     with open(path, encoding="utf-8") as f:
         entries = json.load(f)
@@ -296,7 +445,7 @@ def seed_assets(conn, path):
     return ids
 
 
-SOURCES = {"kev": ingest_kev, "osv": ingest_osv}
+SOURCES = {"coolify": ingest_coolify, "kev": ingest_kev, "osv": ingest_osv}
 
 
 def run(db_path, source="all"):
@@ -329,7 +478,8 @@ def run(db_path, source="all"):
 def main():
     parser = argparse.ArgumentParser(description="SeCute tracker ingest")
     parser.add_argument("--db", default=os.environ.get("SECUTE_DB", "data/secute.db"))
-    parser.add_argument("--source", choices=["all", "kev", "osv"], default="all")
+    parser.add_argument("--source", choices=["all", "kev", "osv", "coolify"],
+                        default="all")
     parser.add_argument("--seed", help="JSON file with asset entries to register")
     args = parser.parse_args()
     if args.seed:

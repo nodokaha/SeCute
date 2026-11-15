@@ -95,8 +95,8 @@ def post_seed(entries: list[AssetIn]):
 
 @app.post("/api/ingest", dependencies=[Depends(require_token)])
 def post_ingest(source: str = "all"):
-    if source not in ("all", "kev", "osv"):
-        raise HTTPException(400, "source must be all, kev or osv")
+    if source not in ("all", "kev", "osv", "coolify"):
+        raise HTTPException(400, "source must be all, kev, osv or coolify")
     return ingest_mod.run(DB_PATH, source)
 
 

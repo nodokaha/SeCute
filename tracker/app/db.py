@@ -97,7 +97,7 @@ ITEM_MUTABLE_FIELDS = {
 
 # When several sources describe the same vulnerability, earlier sources
 # in this list win for display fields in the merged view.
-SOURCE_PRIORITY = ["kev", "osv"]
+SOURCE_PRIORITY = ["kev", "osv", "coolify"]
 
 
 def connect(db_path):
