@@ -80,6 +80,26 @@ def test_sensitive_fields_and_credential_headers():
     assert "Bearer abc" not in blob and '"x"' not in blob
 
 
+def test_target_environment_does_not_inherit_host_secrets(tmp_path, monkeypatch):
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "host-secret")
+    canaries = ta.generate_canaries()
+    env = ta.build_target_env(str(tmp_path), "http://127.0.0.1:1234",
+                              None, canaries)
+    assert "AWS_SECRET_ACCESS_KEY" not in env
+    assert env["HOME"].startswith(str(tmp_path))
+    assert all(c["env"] in env for c in canaries)
+
+
+def test_target_log_redacts_canaries_and_credentials():
+    canaries = ta.generate_canaries()
+    email = next(c["value"] for c in canaries if c["id"] == "email")
+    log = f"email={email} Authorization: Bearer abc api_key=xyz"
+    redacted = ta.redact_target_log(log, canaries)
+    assert email not in redacted
+    assert "Bearer abc" not in redacted
+    assert "api_key=xyz" not in redacted
+
+
 def test_source_mapping(tmp_path):
     src = tmp_path / "app.py"
     src.write_text(

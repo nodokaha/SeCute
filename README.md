@@ -11,17 +11,20 @@
 ## クイックスタート（Tracker）
 
 ```bash
+# .env に十分長いランダムトークンを設定してから起動
+printf 'SECUTE_API_TOKEN=%s\n' "$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')" > .env
 docker compose up -d --build
 # 資産の初期登録（例）
-curl -X POST localhost:8080/api/ingest/seed -H 'Content-Type: application/json' \
-  -d @tracker/config/assets.example.json
+curl -X POST localhost:8080/api/ingest/seed \
+  -H "X-API-Token: $(grep '^SECUTE_API_TOKEN=' .env | cut -d= -f2-)" \
+  -H 'Content-Type: application/json' -d @tracker/config/assets.example.json
 # 脆弱性情報の取り込み
-curl -X POST localhost:8080/api/ingest
+curl -X POST localhost:8080/api/ingest -H "X-API-Token: $(grep '^SECUTE_API_TOKEN=' .env | cut -d= -f2-)"
 # ダッシュボード
 open http://localhost:8080/
 ```
 
-Tracker は個人用の前提。compose はポートを localhost にだけ bind する。公開ネットワークには出さず、リバースプロキシやアクセス制御の内側で使うこと。`SECUTE_API_TOKEN` を設定すると、書き込み系 API（資産登録・取り込み・項目更新）に `X-API-Token` ヘッダーが必須になる。
+Tracker は個人用の前提。compose はポートを localhost にだけ bind する。公開ネットワークには出さず、リバースプロキシやアクセス制御の内側で使うこと。`SECUTE_API_TOKEN` は必須で、書き込み系 API（資産登録・取り込み・項目更新）に `X-API-Token` ヘッダーが必須になる。
 
 取り込みまわりの性質：
 

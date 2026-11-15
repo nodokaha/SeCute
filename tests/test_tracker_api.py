@@ -25,6 +25,13 @@ def test_mutations_require_the_token(client):
     assert r.status_code == 200
 
 
+def test_missing_server_token_fails_closed(monkeypatch):
+    monkeypatch.setattr(main, "API_TOKEN", "")
+    with pytest.raises(Exception, match="SECUTE_API_TOKEN must be configured"):
+        with TestClient(main.app):
+            pass
+
+
 def test_reads_stay_open_without_a_token(client):
     assert client.get("/api/items").status_code == 200
     assert client.get("/api/assets").status_code == 200

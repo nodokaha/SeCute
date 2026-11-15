@@ -279,6 +279,18 @@ def evaluate_tool(tool, out_dir, timed_out):
     exit_code = read_tool_exit(out_dir, spec)
     out_path = os.path.join(out_dir, spec["output"])
     entry = {"status": None, "exit_code": exit_code, "findings": []}
+    if timed_out:
+        entry["status"] = "timeout"
+        entry["detail"] = "container timed out; this run is incomplete"
+        return entry
+    if exit_code is None:
+        entry["status"] = "error"
+        entry["detail"] = "tool did not record an exit code; completion is unverified"
+        return entry
+    if exit_code not in spec["ok_exits"]:
+        entry["status"] = "error"
+        entry["detail"] = f"tool exited with {exit_code}"
+        return entry
     if os.path.exists(out_path):
         try:
             with open(out_path, encoding="utf-8") as f:
@@ -287,27 +299,16 @@ def evaluate_tool(tool, out_dir, timed_out):
             entry["status"] = "invalid"
             entry["detail"] = f"{spec['output']} is not valid JSON"
             return entry
-        if exit_code is not None and exit_code not in spec["ok_exits"]:
-            entry["status"] = "error"
-            entry["detail"] = f"tool exited with {exit_code}"
-            return entry
         entry["findings"] = extract_findings(tool, raw)
         if tool == "syft":
             entry["artifacts"] = len(raw.get("components", []))
         entry["status"] = "findings" if entry["findings"] else "passed"
         return entry
-    # No output file at all.
     if exit_code in spec["missing_ok_exits"]:
         entry["status"] = "passed"
-    elif timed_out and exit_code is None:
-        entry["status"] = "timeout"
-        entry["detail"] = "container timed out before this check finished"
     else:
         entry["status"] = "error"
-        if exit_code is None:
-            entry["detail"] = "tool did not run to completion (no exit code recorded)"
-        else:
-            entry["detail"] = f"tool exited with {exit_code} and produced no output"
+        entry["detail"] = f"tool exited with {exit_code} and produced no output"
     return entry
 
 

@@ -65,6 +65,21 @@ def test_container_timeout_marks_tools_timeout(tmp_path):
     assert all(t["status"] == "timeout" for t in r["tools"].values())
 
 
+def test_timeout_invalidates_parseable_partial_output(tmp_path):
+    r = scenario(tmp_path, {
+        "gitleaks.exit": "0", "gitleaks.json": json.dumps([]),
+        "osv.exit": "0", "osv.json": json.dumps({"results": []}),
+    }, "repo", timed_out=True)
+    assert r["status"] == "failed"
+    assert all(t["status"] == "timeout" for t in r["tools"].values())
+
+
+def test_parseable_output_without_exit_marker_is_not_success(tmp_path):
+    r = scenario(tmp_path, {"osv.json": json.dumps({"results": []})}, "repo")
+    assert r["tools"]["osv-scanner"]["status"] == "error"
+    assert "completion is unverified" in r["tools"]["osv-scanner"]["detail"]
+
+
 def test_unexpected_exit_code_is_error_even_with_parseable_output(tmp_path):
     r = scenario(tmp_path, {
         "gitleaks.exit": "0",
